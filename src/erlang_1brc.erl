@@ -13,6 +13,16 @@ options() ->
   ].
 
 main(Args) ->
+  logger:update_primary_config(#{level => info}),
+  logger:update_formatter_config(
+    default,
+    #{ legacy_header => false
+     , single_line => true
+     , template => [time, " ", level, ": ", pid, ": ", msg, "\n"]
+     }),
+
+  logger:info(#{label => "Starting"}),
+
   case getopt:parse(options(), Args) of
     {ok, {Opts, []}} ->
       Iters = proplists:get_value(repeat, Opts),
@@ -30,14 +40,16 @@ main(Args) ->
             bench(fun() -> do_main(Opts) end, Iters)
         end,
 
-      io:format("Total elapsed time: ~w ~tcs (~w seconds) (~w iterations)~n",
-                [Time, 16#b5,
-                 erlang:convert_time_unit(Time, microsecond, second),
-                 Iters]);
+      logger:info(#{label => "Finished",
+                    elapsed_secs => Time / 1_000_000.0,
+                    iterations => Iters});
+
     {error, Reason} ->
       io:format("Failed to parse options: ~p~n", [Reason]),
       io:format("~p~n", [getopt:usage(options(), escript:script_name())])
-  end.
+  end,
+  logger_std_h:filesync(default).
+
 
 do_main(Opts) ->
   Filename = proplists:get_value(file, Opts),
