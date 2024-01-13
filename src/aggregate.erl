@@ -12,16 +12,28 @@ aggregate_measurements(Filename, Opts) ->
   Start = erlang:monotonic_time(),
   BufSize = proplists:get_value(bufsize, Opts),
   {ok, FD} = prim_file:open(Filename, [read]),
-  LineProcessorPid = proc_lib:start_link(?MODULE, line_processor, []),
-  ProcessorPid = proc_lib:start_link(?MODULE, chunk_processor, []),
-  ProcessorPid ! {line_processor, LineProcessorPid},
-  read_chunks(FD, 0, <<>>, BufSize, ProcessorPid),
+  LineProcessorPid1 = proc_lib:start_link(?MODULE, line_processor, []),
+  LineProcessorPid2 = proc_lib:start_link(?MODULE, line_processor, []),
+  ProcessorPid1 = proc_lib:start_link(?MODULE, chunk_processor, []),
+  ProcessorPid2 = proc_lib:start_link(?MODULE, chunk_processor, []),
+  ProcessorPid1 ! {line_processor, LineProcessorPid1},
+  ProcessorPid2 ! {line_processor, LineProcessorPid2},
+  read_chunks(FD, 0, 0, <<>>, BufSize, [ProcessorPid1, ProcessorPid2]),
   Now = erlang:monotonic_time(),
   logger:info(#{label => "All chunks read",
                 elapsed_secs => (Now - Start) / 1000_000_000.0}),
-  wait_for_completion(LineProcessorPid).
+  wait_for_completion(
+   [ ProcessorPid1
+   , ProcessorPid2
+   , LineProcessorPid1
+   , LineProcessorPid2
+   ]).
 
-read_chunks(FD, Offset, PrevChunk, BufSize, TargetPid) ->
+read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
+
+  TargetPid = lists:nth((N rem length(TargetPids)) + 1, TargetPids),
+  %% logger:info(#{label => "Reading chunk",
+  %%               target_pid => TargetPid}),
   case prim_file:pread(FD, Offset, BufSize) of
     {ok, Bin} ->
       Size = byte_size(Bin),
@@ -30,55 +42,62 @@ read_chunks(FD, Offset, PrevChunk, BufSize, TargetPid) ->
       case binary:split(Bin, <<"\n">>) of
         [First, NextChunk] ->
           send_chunk(<<PrevChunk/binary, First/binary>>, TargetPid),
-          read_chunks(FD, Offset + Size, NextChunk, BufSize, TargetPid);
+          read_chunks(FD, N + 1, Offset + Size, NextChunk, BufSize, TargetPids);
         [Chunk] ->
           send_chunk(Chunk, TargetPid),
-          read_chunks(FD, Offset + Size, <<>>, BufSize, TargetPid)
+          read_chunks(FD, N + 1, Offset + Size, <<>>, BufSize, TargetPids)
       end;
     eof ->
       %% Reached end of file, process the last chunk
       send_chunk(PrevChunk, TargetPid),
-      TargetPid ! eof,
+      lists:foreach(fun(Pid) -> Pid ! eof end, TargetPids),
       ok
   end.
 
 send_chunk(Chunk, TargetPid) ->
   TargetPid ! {chunk, Chunk}.
 
+wait_for_completion([]) ->
+  logger:info(#{label => "All subprocesses finished"}),
+  ok;
+wait_for_completion(Pids) ->
+  logger:info(#{label => "Waiting for subprocesses to finish",
+                pids => Pids}),
+  receive
+    {'EXIT', Pid, normal} ->
+      logger:info(#{label => "Pid finished", pid => Pid}),
+      wait_for_completion(Pids -- [Pid]),
+      ok;
+    _ ->
+      logger:error(#{label => "Unexpected message"})
+  end.
+
+-record(chunk_state, { line_processor_pid
+                     }).
+
 chunk_processor() ->
   proc_lib:init_ack(self()),
   logger:info(#{label => "Chunk processor running"}),
-  chunk_processor_loop(undefined).
+  chunk_processor_loop(#chunk_state{}).
 
 chunk_processor_loop(State) ->
   receive
-    {line_processor, LineProcessorPid} ->
-      chunk_processor_loop(LineProcessorPid);
+    {line_processor, Pid} ->
+      chunk_processor_loop(State#chunk_state{line_processor_pid = Pid});
     {chunk, Chunk} ->
       process_chunk(Chunk, State),
       chunk_processor_loop(State);
     eof ->
-      State ! eof,
+      logger:info(#{label => "Chunk processor finished."}),
+      State#chunk_state.line_processor_pid ! eof,
       ok;
     _ ->
       logger:error(#{label => "Unexpected message"})
   end.
 
-wait_for_completion(WaitForPid) ->
-  receive
-    {'EXIT', Pid, normal} when Pid =:= WaitForPid ->
-      logger:info(#{label => "Pid finished", pid => Pid}),
-      ok;
-    {'EXIT', Pid, normal} ->
-      logger:info(#{label => "Pid finished", pid => Pid}),
-      wait_for_completion(WaitForPid);
-    _ ->
-      logger:error(#{label => "Unexpected message"})
-  end.
-
-process_chunk(Chunk, LineProcessorPid) ->
-  Lines = binary:split(Chunk, <<"\n">>, [global]),
-  LineProcessorPid ! {lines, Lines}.
+process_chunk(Chunk, State) ->
+  Lines = binary:split(Chunk, [<<"\n">>, <<";">>], [global]),
+  State#chunk_state.line_processor_pid ! {lines, Lines}.
 
 line_processor() ->
   proc_lib:init_ack(self()),
@@ -87,14 +106,22 @@ line_processor() ->
 
 line_processor_loop() ->
   receive
-    {lines, Lines} ->
-      lists:foreach(fun process_line/1, Lines),
+    {lines, _Lines} ->
+      %% process_lines(Lines),
       line_processor_loop();
     eof ->
+      logger:info(#{label => "Line processor finished"}),
       ok;
     _ ->
       logger:error(#{label => "Unexpected message"})
   end.
 
-process_line(_Line) ->
-  ok.
+process_lines([]) ->
+  ok;
+process_lines([<<>>]) ->
+  ok;
+process_lines([_Station, _Temp|Rest]) ->
+  %% logger:info(#{label => "Processing line",
+  %%               station => Station,
+  %%               temp => Temp}),
+  process_lines(Rest).

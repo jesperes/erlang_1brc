@@ -13,7 +13,7 @@ options() ->
   ].
 
 main(Args) ->
-  logger:update_primary_config(#{level => info}),
+  logger:update_primary_config(#{level => debug}),
   logger:update_formatter_config(
     default,
     #{ legacy_header => false
@@ -29,8 +29,9 @@ main(Args) ->
       Time =
         case proplists:get_value(eprof, Opts) of
           true ->
+            logger:info(#{label => "Enabling eprof"}),
             eprof:start(),
-            eprof:start_profiling([self()]),
+            eprof:start_profiling(erlang:processes()),
             T = bench(fun() -> do_main(Opts) end, Iters),
             eprof:stop_profiling(),
             eprof:analyze(),
