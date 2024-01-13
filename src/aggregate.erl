@@ -12,8 +12,8 @@ aggregate_measurements(Filename, Opts) ->
   ProcessorPid = proc_lib:start_link(?MODULE, chunk_processor, []),
   read_chunks(FD, BufSize, ProcessorPid),
   Now = erlang:monotonic_time(),
-  io:format("All chunks read after ~p secs, waiting for chunk processor~n",
-            [erlang:convert_time_unit(Now - Start, native, second)]),
+  io:format("All chunks read after ~.2f seconds, waiting for chunk processor~n",
+            [(Now - Start) / 1000_000_000.0]),
   wait_for_completion(ProcessorPid).
 
 read_chunks(FD, BufSize, TargetPid) ->
@@ -27,32 +27,35 @@ read_chunks(FD, BufSize, TargetPid) ->
   end.
 
 process_chunk(Chunk, TargetPid) ->
-  io:format("Processing chunk of size ~p, sending to ~p~n", [byte_size(Chunk), TargetPid]),
   TargetPid ! {chunk, Chunk}.
 
 chunk_processor() ->
   proc_lib:init_ack(self()),
-  io:format("Started chunk processor: ~p~n", [self()]),
   chunk_processor_loop().
 
 chunk_processor_loop() ->
   receive
     {chunk, Chunk} ->
-      io:format("Chunk processor received ~p~n", [byte_size(Chunk)]),
+      process_chunk(Chunk),
       chunk_processor_loop();
-    eof ->
-      %% No more chunks to process
-      ok;
-    Other ->1
-      io:format("Other: ~p~n", [Other]),
-      chunk_processor_loop()
+    eof -> ok;
+    Other ->
+      throw({unexpected, Other})
   end.
 
 wait_for_completion(ProcessorPid) ->
   receive
     {'EXIT', Pid, normal} when Pid =:= ProcessorPid ->
       io:format("Processor pid finished.~n", []);
-    X ->
-      io:format(">>> ~p~n", [X]),
-      wait_for_completion(ProcessorPid)
+    {'EXIT', Pid, Reason} ->
+      io:format("*** Unexpected crash in ~p: ~p~n", [Pid, Reason]),
+      erlang:halt(1);
+    Other ->
+      io:format("*** Unexpected return >>> ~p~n", [Other]),
+      wait_for_completion(ProcessorPid),
+      erlang:halt(1)
   end.
+
+process_chunk(Chunk) ->
+  io:format("Chunk processor received ~p bytes of data~n", [byte_size(Chunk)]),
+  timer:sleep(100).
