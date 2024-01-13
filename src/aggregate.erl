@@ -12,28 +12,28 @@ aggregate_measurements(Filename, Opts) ->
   Start = erlang:monotonic_time(),
   BufSize = proplists:get_value(bufsize, Opts),
   {ok, FD} = prim_file:open(Filename, [read]),
-  LineProcessorPid1 = proc_lib:start_link(?MODULE, line_processor, []),
-  LineProcessorPid2 = proc_lib:start_link(?MODULE, line_processor, []),
-  ProcessorPid1 = proc_lib:start_link(?MODULE, chunk_processor, []),
-  ProcessorPid2 = proc_lib:start_link(?MODULE, chunk_processor, []),
-  ProcessorPid1 ! {line_processor, LineProcessorPid1},
-  ProcessorPid2 ! {line_processor, LineProcessorPid2},
-  read_chunks(FD, 0, 0, <<>>, BufSize, [ProcessorPid1, ProcessorPid2]),
+  NumProcessors = erlang:system_info(schedulers) div 2,
+  {ProcessorPids, AllPids} = start_processors(NumProcessors),
+  read_chunks(FD, 0, 0, <<>>, BufSize, ProcessorPids),
   Now = erlang:monotonic_time(),
   logger:info(#{label => "All chunks read",
                 elapsed_secs => (Now - Start) / 1000_000_000.0}),
-  wait_for_completion(
-   [ ProcessorPid1
-   , ProcessorPid2
-   , LineProcessorPid1
-   , LineProcessorPid2
-   ]).
+  wait_for_completion(AllPids).
+
+start_processors(NumProcs) ->
+  logger:info(#{label => "Starting processing pipelines",
+                num_pipelines => NumProcs}),
+  lists:foldl(
+    fun(_, {ProcessorPids, AllPids}) ->
+        LineProcessorPid = proc_lib:start_link(?MODULE, line_processor, []),
+        ProcessorPid = proc_lib:start_link(?MODULE, chunk_processor, []),
+        ProcessorPid ! {line_processor, LineProcessorPid},
+        {[ProcessorPid|ProcessorPids],
+         [ProcessorPid, LineProcessorPid|AllPids]}
+    end, {[], []}, lists:seq(1, NumProcs)).
 
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
-
   TargetPid = lists:nth((N rem length(TargetPids)) + 1, TargetPids),
-  %% logger:info(#{label => "Reading chunk",
-  %%               target_pid => TargetPid}),
   case prim_file:pread(FD, Offset, BufSize) of
     {ok, Bin} ->
       Size = byte_size(Bin),
@@ -61,18 +61,21 @@ wait_for_completion([]) ->
   logger:info(#{label => "All subprocesses finished"}),
   ok;
 wait_for_completion(Pids) ->
-  logger:info(#{label => "Waiting for subprocesses to finish",
-                pids => Pids}),
   receive
     {'EXIT', Pid, normal} ->
-      logger:info(#{label => "Pid finished", pid => Pid}),
       wait_for_completion(Pids -- [Pid]),
       ok;
     _ ->
       logger:error(#{label => "Unexpected message"})
   end.
 
+%%
+%% Chunk processor: this step in the pipeline takes a binary
+%% consisting of an even number of line, splits it at "\n" and ";" and
+%% passes it on to the line processor.
+%%
 -record(chunk_state, { line_processor_pid
+                     , count = 0
                      }).
 
 chunk_processor() ->
@@ -80,13 +83,18 @@ chunk_processor() ->
   logger:info(#{label => "Chunk processor running"}),
   chunk_processor_loop(#chunk_state{}).
 
-chunk_processor_loop(State) ->
+chunk_processor_loop(#chunk_state{count = Count} = State) ->
+  if Count rem 100 == 0 ->
+      logger:debug(#{chunks_processed => Count});
+     true -> ok
+  end,
+
   receive
     {line_processor, Pid} ->
       chunk_processor_loop(State#chunk_state{line_processor_pid = Pid});
     {chunk, Chunk} ->
       process_chunk(Chunk, State),
-      chunk_processor_loop(State);
+      chunk_processor_loop(State#chunk_state{count = State#chunk_state.count + 1});
     eof ->
       logger:info(#{label => "Chunk processor finished."}),
       State#chunk_state.line_processor_pid ! eof,
@@ -99,15 +107,18 @@ process_chunk(Chunk, State) ->
   Lines = binary:split(Chunk, [<<"\n">>, <<";">>], [global]),
   State#chunk_state.line_processor_pid ! {lines, Lines}.
 
+
+%%
+%% The line processor
+%%
 line_processor() ->
   proc_lib:init_ack(self()),
-  logger:info(#{label => "Line processor running"}),
   line_processor_loop().
 
 line_processor_loop() ->
   receive
-    {lines, _Lines} ->
-      %% process_lines(Lines),
+    {lines, Lines} ->
+      process_lines(Lines),
       line_processor_loop();
     eof ->
       logger:info(#{label => "Line processor finished"}),
@@ -120,8 +131,6 @@ process_lines([]) ->
   ok;
 process_lines([<<>>]) ->
   ok;
-process_lines([_Station, _Temp|Rest]) ->
-  %% logger:info(#{label => "Processing line",
-  %%               station => Station,
-  %%               temp => Temp}),
+process_lines([_Station, Temp|Rest]) ->
+  _ = binary_to_float(Temp),
   process_lines(Rest).

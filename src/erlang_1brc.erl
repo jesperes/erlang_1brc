@@ -21,8 +21,6 @@ main(Args) ->
      , template => [time, " ", level, ": ", pid, ": ", msg, "\n"]
      }),
 
-  logger:info(#{label => "Starting"}),
-
   case getopt:parse(options(), Args) of
     {ok, {Opts, []}} ->
       Iters = proplists:get_value(repeat, Opts),
