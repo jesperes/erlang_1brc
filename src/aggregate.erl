@@ -3,6 +3,7 @@
 -export([ aggregate_measurements/2
         , chunk_processor/0
         , line_processor/0
+        , parse_float/1
         ]).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -83,17 +84,17 @@ chunk_processor() ->
   logger:info(#{label => "Chunk processor running"}),
   chunk_processor_loop(#chunk_state{}).
 
-chunk_processor_loop(#chunk_state{count = Count} = State) ->
-  if Count rem 100 == 0 ->
-      logger:debug(#{chunks_processed => Count});
-     true -> ok
-  end,
-
+chunk_processor_loop(#chunk_state{count = _Count} = State) ->
+  %% if Count rem 100 == 0 ->
+  %%     logger:debug(#{chunks_processed => Count});
+  %%    true -> ok
+  %% end,
   receive
     {line_processor, Pid} ->
       chunk_processor_loop(State#chunk_state{line_processor_pid = Pid});
     {chunk, Chunk} ->
-      process_chunk(Chunk, State),
+      State#chunk_state.line_processor_pid !
+        {lines, binary:split(Chunk, [<<"\n">>, <<";">>], [global])},
       chunk_processor_loop(State#chunk_state{count = State#chunk_state.count + 1});
     eof ->
       logger:info(#{label => "Chunk processor finished."}),
@@ -102,11 +103,6 @@ chunk_processor_loop(#chunk_state{count = Count} = State) ->
     _ ->
       logger:error(#{label => "Unexpected message"})
   end.
-
-process_chunk(Chunk, State) ->
-  Lines = binary:split(Chunk, [<<"\n">>, <<";">>], [global]),
-  State#chunk_state.line_processor_pid ! {lines, Lines}.
-
 
 %%
 %% The line processor
@@ -132,5 +128,33 @@ process_lines([]) ->
 process_lines([<<>>]) ->
   ok;
 process_lines([_Station, Temp|Rest]) ->
-  _ = binary_to_float(Temp),
+  _ = parse_float(Temp),
   process_lines(Rest).
+
+%% Very specialized float-parser for floats with a single fractional
+%% digit, and returns the result as an integer * 10.
+-define(TO_NUM(C), (C - $0)).
+
+parse_float(<<$-, A, B, $., C>>) ->
+  -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C));
+parse_float(<<$-, B, $., C>>) ->
+  -1 * (?TO_NUM(B) * 10 + ?TO_NUM(C));
+parse_float(<<A, B, $., C>>) ->
+  ?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C);
+parse_float(<<B, $., C>>) ->
+  ?TO_NUM(B) * 10 + ?TO_NUM(C).
+
+-ifdef(TEST).
+
+parse_float_test() ->
+  lists:foreach(fun({Bin, Exp}) ->
+                    Float = parse_float(Bin),
+                    ?debugVal({Bin, Float}),
+                    ?assert(abs(Exp - Float) =< 0.0001)
+                end,
+                [ {<<"-0.5">>, -5}
+                , {<<"-10.5">>, -105}
+                , {<<"10.5">>, 105}
+                ]).
+
+-endif.
