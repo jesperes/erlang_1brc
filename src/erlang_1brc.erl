@@ -5,15 +5,16 @@
 -include_lib("eunit/include/eunit.hrl").
 
 options() ->
-  [ {file,     $f, "file",     {string, "measurements.txt"}, "The input file."}
-  , {io_bench, $i, "io-bench", string,                       "Perform I/O benchmarking"}
-  , {repeat,   $n, "repeat",   {integer, 1},                 "Number of iterations."}
-  , {eprof,    $e, "eprof",    undefined,                    "Run code under eprof."}
-  , {bufsize,  $c, "bufsize",  {integer, 4096},              "Buffer size."}
+  [ {file,      $f, "file",     {string, "measurements.txt"}, "The input file."}
+  , {io_bench,  $i, "io-bench", string,                       "Perform I/O benchmarking"}
+  , {repeat,    $n, "repeat",   {integer, 1},                 "Number of iterations."}
+  , {eprof,     $e, "eprof",    undefined,                    "Run code under eprof."}
+  , {bufsize,   $c, "bufsize",  {integer, 256 * 1024},        "Buffer size."}
+  , {log_level, $l, "log_level", {atom, info},                "Log level."}
+  , {no_output, undefined, "no_output", undefined,            "Do not print output to stdout."}
   ].
 
 main(Args) ->
-  logger:update_primary_config(#{level => debug}),
   logger:update_formatter_config(
     default,
     #{ legacy_header => false
@@ -23,6 +24,9 @@ main(Args) ->
 
   case getopt:parse(options(), Args) of
     {ok, {Opts, []}} ->
+      LogLevel = proplists:get_value(log_level, Opts),
+      logger:update_primary_config(#{level => LogLevel}),
+
       Iters = proplists:get_value(repeat, Opts),
       Time =
         case proplists:get_value(eprof, Opts) of
