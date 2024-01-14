@@ -12,13 +12,14 @@ aggregate_measurements(Filename, Opts) ->
   process_flag(trap_exit, true),
   Start = erlang:monotonic_time(),
   BufSize = proplists:get_value(bufsize, Opts),
-  logger:info(#{label => "Starting", bufsize => BufSize}),
+  logger:info(#{bufsize => BufSize}),
   {ok, FD} = prim_file:open(Filename, [read]),
-  NumProcessors = erlang:system_info(schedulers) div 2,
+  NumProcessors =
+    proplists:get_value(parallel, Opts, erlang:system_info(schedulers) div 2),
   {ProcessorPids, AllPids} = start_processors(NumProcessors),
   read_chunks(FD, 0, 0, <<>>, BufSize, ProcessorPids),
   Now = erlang:monotonic_time(),
-  logger:info(#{label => "All chunks read",
+  logger:info(#{label => "All chunks read, waiting for processors to finish",
                 elapsed_secs => (Now - Start) / 1000_000_000.0}),
   Map = wait_for_completion(AllPids, #{}),
 
