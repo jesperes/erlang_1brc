@@ -54,7 +54,6 @@ read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
       case binary:split(Bin, <<"\n">>) of
         [First, NextChunk] ->
           send_chunk(<<PrevChunk/binary, First/binary>>, TargetPid),
-          %% sleep_if_target_pid_mql_too_long(TargetPid, 20),
           read_chunks(FD, N + 1, Offset + Size, NextChunk, BufSize, TargetPids);
         [Chunk] ->
           send_chunk(Chunk, TargetPid),
