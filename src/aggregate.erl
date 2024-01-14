@@ -48,6 +48,17 @@ start_processors(NumProcs) ->
          [ProcessorPid, LineProcessorPid|AllPids]}
     end, {[], []}, lists:seq(1, NumProcs)).
 
+sleep_if_target_pid_mql_too_long(Pid, Threshold) ->
+  {_, MQL} = process_info(Pid, message_queue_len),
+  if MQL > Threshold ->
+      %% logger:info(#{label => "MQL too long, sleeping",
+      %%               target_pid => Pid}),
+      timer:sleep(1),
+      sleep_if_target_pid_mql_too_long(Pid, Threshold);
+     true ->
+      ok
+  end.
+
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
   TargetPid = lists:nth((N rem length(TargetPids)) + 1, TargetPids),
   case prim_file:pread(FD, Offset, BufSize) of
@@ -58,6 +69,7 @@ read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
       case binary:split(Bin, <<"\n">>) of
         [First, NextChunk] ->
           send_chunk(<<PrevChunk/binary, First/binary>>, TargetPid),
+          %% sleep_if_target_pid_mql_too_long(TargetPid, 20),
           read_chunks(FD, N + 1, Offset + Size, NextChunk, BufSize, TargetPids);
         [Chunk] ->
           send_chunk(Chunk, TargetPid),
@@ -95,15 +107,17 @@ merge_location_data(Map1, Map2) ->
     fun(Station, Map) ->
         case {maps:get(Station, Map1, undefined),
               maps:get(Station, Map2, undefined)} of
-          {#location{} = Loc1, undefined} -> maps:put(Station, Loc1, Map);
-          {undefined, #location{} = Loc2} -> maps:put(Station, Loc2, Map);
+          {Loc1, undefined} -> maps:put(Station, Loc1, Map);
+          {undefined, Loc2} -> maps:put(Station, Loc2, Map);
           {Loc1, Loc2} ->
+            {Min1, Max1, Count1, Sum1} = Loc1,
+            {Min2, Max2, Count2, Sum2} = Loc2,
             maps:put(
               Station,
-              #location{count = Loc1#location.count + Loc2#location.count,
-                        min = min(Loc1#location.min, Loc2#location.min),
-                        max = max(Loc1#location.max, Loc2#location.max),
-                        sum = Loc1#location.sum + Loc2#location.sum},
+              {min(Min1, Min2),
+               max(Max1, Max2),
+               Count1 + Count2,
+               Sum1 + Sum2},
               Map)
         end
     end, #{}, Stations).
@@ -113,10 +127,7 @@ format_final_map(Map) ->
     lists:join(
       ", ",
       lists:map(
-        fun({Station, #location{min = Min,
-                                max = Max,
-                                count = Count,
-                                sum = Sum}}) ->
+        fun({Station, {Min, Max, Count, Sum}}) ->
             Mean = Sum / Count,
             io_lib:format("~ts=~.1f/~.1f/~.1f",
                           [Station, Min/10, Mean/10, Max/10])
@@ -142,6 +153,9 @@ chunk_processor_loop(#chunk_state{count = _Count} = State) ->
   %%     logger:debug(#{chunks_processed => Count});
   %%    true -> ok
   %% end,
+  %%{message_queue_len, MQL} = process_info(self(), message_queue_len),
+  %%logger:info(#{mql => MQL}),
+
   receive
     {line_processor, Pid} ->
       chunk_processor_loop(State#chunk_state{line_processor_pid = Pid});
@@ -173,11 +187,18 @@ line_processor_loop(State) ->
       line_processor_loop(State#line_state{result_pid = Pid});
     {lines, Lines} ->
       State0 = process_lines(Lines, State),
-      logger:info(#{proc_dict_size => length(get_keys())}),
       line_processor_loop(State0);
     eof ->
-      State#line_state.result_pid ! {result, self(), State#line_state.map},
-      logger:info(#{label => "Line processor finished"}),
+      Map = maps:from_list(
+              lists:filtermap(
+                fun({{station, Station}, Data}) ->
+                    {true, {Station, Data}};
+                   (_) -> false
+                end, get())),
+      State#line_state.result_pid ! {result, self(), Map},
+      {heap_size, HeapSize} = process_info(self(), heap_size),
+      logger:info(#{label => "Line processor finished",
+                    heap_size => HeapSize}),
       ok;
     _ ->
       logger:error(#{label => "Unexpected message"})
@@ -189,32 +210,25 @@ process_lines([<<>>], State) ->
   State;
 process_lines([Station, TempBin|Rest], State) ->
   Temp = parse_float(TempBin),
-  Default = #location{max = Temp, min = Temp, count = 1, sum = Temp},
-  %% NewMap =
-  %%   maps:update_with(
-  %%     Station,
-  %%     fun(Old) -> update_location_data(Old, Temp) end,
-  %%     #location{max = Temp, min = Temp, count = 1, sum = Temp},
-  %%     State#line_state.map),
-  %% NewMap = maps:put(Station, Temp, State#line_state.map),
-  case get({station, Station}) of
-    undefined -> put({station, Station}, Default);
-    Old -> put({station, Station}, update_location_data(Old, Temp))
+  Key = {station, Station},
+  case get(Key) of
+    undefined ->
+      put(Key, { Temp % min
+               , Temp % max
+               , 1    % count
+               , Temp % sum
+               });
+
+    {OldMin, OldMax, OldCount, OldSum} ->
+      put(Key, { min(OldMin, Temp)
+               , max(OldMax, Temp)
+               , OldCount + 1
+               , OldSum + Temp
+               })
+
   end,
-  %put({station, Station},
-  %State0 = State#line_state{map = NewMap},
   State0 = State,
   process_lines(Rest, State0).
-
-update_location_data(#location{max = Max,
-                               min = Min,
-                               sum = Sum,
-                               count = Count} = _Old,
-                     Temp) ->
-  #location{max = max(Max, Temp),
-            min = min(Min, Temp),
-            sum = Sum + Temp,
-            count = Count + 1}.
 
 %% Very specialized float-parser for floats with a single fractional
 %% digit, and returns the result as an integer * 10.
