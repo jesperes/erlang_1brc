@@ -9,7 +9,7 @@ options() ->
   , {io_bench,  $i, "io-bench", string,                       "Perform I/O benchmarking"}
   , {repeat,    $n, "repeat",   {integer, 1},                 "Number of iterations."}
   , {eprof,     $e, "eprof",    undefined,                    "Run code under eprof."}
-  , {bufsize,   $c, "bufsize",  {integer, 256 * 1024},        "Buffer size."}
+  , {bufsize,   $c, "bufsize",  {integer, 2 * 1024 * 1024},   "Buffer size."}
   , {log_level, $l, "log_level", {atom, info},                "Log level."}
   , {no_output, undefined, "no_output", undefined,            "Do not print output to stdout."}
   ].

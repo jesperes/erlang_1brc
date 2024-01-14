@@ -8,13 +8,6 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--record(location, { max   :: integer()
-                  , min   :: integer()
-                  , sum   :: integer()
-                  , count :: integer()
-                  }).
-
-
 aggregate_measurements(Filename, Opts) ->
   process_flag(trap_exit, true),
   Start = erlang:monotonic_time(),
@@ -28,6 +21,8 @@ aggregate_measurements(Filename, Opts) ->
   logger:info(#{label => "All chunks read",
                 elapsed_secs => (Now - Start) / 1000_000_000.0}),
   Map = wait_for_completion(AllPids, #{}),
+
+  %% ?assertMatch({_, 180, _, _}, maps:get(<<"Abha">>, Map)),
   Fmt = format_final_map(Map),
   case proplists:get_value(no_output, Opts, false) of
     true -> ok;
@@ -47,17 +42,6 @@ start_processors(NumProcs) ->
         {[ProcessorPid|ProcessorPids],
          [ProcessorPid, LineProcessorPid|AllPids]}
     end, {[], []}, lists:seq(1, NumProcs)).
-
-sleep_if_target_pid_mql_too_long(Pid, Threshold) ->
-  {_, MQL} = process_info(Pid, message_queue_len),
-  if MQL > Threshold ->
-      %% logger:info(#{label => "MQL too long, sleeping",
-      %%               target_pid => Pid}),
-      timer:sleep(1),
-      sleep_if_target_pid_mql_too_long(Pid, Threshold);
-     true ->
-      ok
-  end.
 
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
   TargetPid = lists:nth((N rem length(TargetPids)) + 1, TargetPids),
@@ -95,7 +79,7 @@ wait_for_completion(Pids, Map) ->
     {result, SenderPid, NewMap} ->
       logger:info(#{label => "Got result",
                     sender => SenderPid,
-                    result_size => maps:size(Map)}),
+                    result_size => maps:size(NewMap)}),
       wait_for_completion(Pids, merge_location_data(Map, NewMap));
     _ ->
       logger:error(#{label => "Unexpected message"})
@@ -104,14 +88,17 @@ wait_for_completion(Pids, Map) ->
 merge_location_data(Map1, Map2) ->
   Stations = lists:usort(maps:keys(Map1) ++ maps:keys(Map2)),
   lists:foldl(
-    fun(Station, Map) ->
+    fun(Station, Map) when Station =:= '$ancestors' orelse
+                           Station =:= '$initial_call' ->
+        Map;
+       (Station, Map) ->
         case {maps:get(Station, Map1, undefined),
               maps:get(Station, Map2, undefined)} of
-          {Loc1, undefined} -> maps:put(Station, Loc1, Map);
-          {undefined, Loc2} -> maps:put(Station, Loc2, Map);
-          {Loc1, Loc2} ->
-            {Min1, Max1, Count1, Sum1} = Loc1,
-            {Min2, Max2, Count2, Sum2} = Loc2,
+          {Data1, undefined} -> maps:put(Station, Data1, Map);
+          {undefined, Data2} -> maps:put(Station, Data2, Map);
+          {Data1, Data2} ->
+            {Min1, Max1, Count1, Sum1} = Data1,
+            {Min2, Max2, Count2, Sum2} = Data2,
             maps:put(
               Station,
               {min(Min1, Min2),
@@ -139,34 +126,21 @@ format_final_map(Map) ->
 %% consisting of an even number of line, splits it at "\n" and ";" and
 %% passes it on to the line processor.
 %%
--record(chunk_state, { line_processor_pid
-                     , count = 0
-                     }).
-
 chunk_processor() ->
   proc_lib:init_ack(self()),
   logger:info(#{label => "Chunk processor running"}),
-  chunk_processor_loop(#chunk_state{}).
+  chunk_processor_loop(undefined).
 
-chunk_processor_loop(#chunk_state{count = _Count} = State) ->
-  %% if Count rem 100 == 0 ->
-  %%     logger:debug(#{chunks_processed => Count});
-  %%    true -> ok
-  %% end,
-  %%{message_queue_len, MQL} = process_info(self(), message_queue_len),
-  %%logger:info(#{mql => MQL}),
-
+chunk_processor_loop(Pid) ->
   receive
-    {line_processor, Pid} ->
-      chunk_processor_loop(State#chunk_state{line_processor_pid = Pid});
+    {line_processor, LineProcessorPid} ->
+      chunk_processor_loop(LineProcessorPid);
     {chunk, Chunk} ->
-      State#chunk_state.line_processor_pid !
-        {lines, binary:split(Chunk, [<<"\n">>, <<";">>], [global])},
-      chunk_processor_loop(State#chunk_state{count = State#chunk_state.count + 1});
+      Pid ! {lines, binary:split(Chunk, [<<"\n">>, <<";">>], [global])},
+      chunk_processor_loop(Pid);
     eof ->
       logger:info(#{label => "Chunk processor finished."}),
-      State#chunk_state.line_processor_pid ! eof,
-      ok;
+      Pid ! eof;
     _ ->
       logger:error(#{label => "Unexpected message"})
   end.
@@ -175,27 +149,20 @@ chunk_processor_loop(#chunk_state{count = _Count} = State) ->
 %% The line processor
 %%
 
--record(line_state, { map = #{}, result_pid = undefined }).
-
 line_processor() ->
   proc_lib:init_ack(self()),
-  line_processor_loop(#line_state{}).
+  line_processor_loop(undefined).
 
-line_processor_loop(State) ->
+line_processor_loop(ResultPid) ->
   receive
     {result_pid, Pid} ->
-      line_processor_loop(State#line_state{result_pid = Pid});
+      line_processor_loop(Pid);
     {lines, Lines} ->
-      State0 = process_lines(Lines, State),
-      line_processor_loop(State0);
+      process_lines(Lines),
+      line_processor_loop(ResultPid);
     eof ->
-      Map = maps:from_list(
-              lists:filtermap(
-                fun({{station, Station}, Data}) ->
-                    {true, {Station, Data}};
-                   (_) -> false
-                end, get())),
-      State#line_state.result_pid ! {result, self(), Map},
+      Map = maps:from_list(get()),
+      ResultPid ! {result, self(), Map},
       {heap_size, HeapSize} = process_info(self(), heap_size),
       logger:info(#{label => "Line processor finished",
                     heap_size => HeapSize}),
@@ -204,31 +171,29 @@ line_processor_loop(State) ->
       logger:error(#{label => "Unexpected message"})
   end.
 
-process_lines([], State) ->
-  State;
-process_lines([<<>>], State) ->
-  State;
-process_lines([Station, TempBin|Rest], State) ->
+process_lines([]) ->
+  ok;
+process_lines([<<>>]) ->
+  ok;
+process_lines([Station, TempBin|Rest]) ->
   Temp = parse_float(TempBin),
-  Key = {station, Station},
-  case get(Key) of
+  case get(Station) of
     undefined ->
-      put(Key, { Temp % min
-               , Temp % max
-               , 1    % count
-               , Temp % sum
-               });
+      put(Station, { Temp % min
+                   , Temp % max
+                   , 1    % count
+                   , Temp % sum
+                   });
 
     {OldMin, OldMax, OldCount, OldSum} ->
-      put(Key, { min(OldMin, Temp)
-               , max(OldMax, Temp)
-               , OldCount + 1
-               , OldSum + Temp
-               })
+      put(Station, { min(OldMin, Temp)
+                   , max(OldMax, Temp)
+                   , OldCount + 1
+                   , OldSum + Temp
+                   })
 
   end,
-  State0 = State,
-  process_lines(Rest, State0).
+  process_lines(Rest).
 
 %% Very specialized float-parser for floats with a single fractional
 %% digit, and returns the result as an integer * 10.
