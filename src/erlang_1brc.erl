@@ -9,6 +9,7 @@ options() ->
   , {log_level, $l, "log_level", {atom, info},                "Log level."}
   , {no_output, undefined, "no_output", undefined,            "Do not print output to stdout."}
   , {parallel,  $p, "parallel", integer,                      "Number of parallel processing pipelines."}
+  , {backend, $b, "backend", {atom, aggregate}, "The backend to use"}
   ].
 
 main(Args) ->
@@ -44,5 +45,6 @@ main(Args) ->
 
 do_main(Opts) ->
   Filename = proplists:get_value(file, Opts),
-  {Time, _} = timer:tc(fun() -> aggregate:aggregate_measurements(Filename, Opts) end),
+    Backend = proplists:get_value(backend, Opts),
+  {Time, _} = timer:tc(fun() -> Backend:aggregate_measurements(Filename, Opts) end),
   Time.
