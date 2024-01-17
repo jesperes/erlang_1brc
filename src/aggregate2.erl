@@ -2,9 +2,9 @@
 
 -export([ aggregate_measurements/2
         , chunk_processor/0
-        , line_processor/0
-        , parse_float/1
         ]).
+
+-compile({inline,[{process_temp,2},{process_line,3}]}).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -15,9 +15,10 @@ aggregate_measurements(Filename, Opts) ->
   logger:info(#{bufsize => BufSize}),
   {ok, FD} = prim_file:open(Filename, [read]),
   NumProcessors =
-    proplists:get_value(parallel, Opts, erlang:system_info(schedulers) div 2),
+    proplists:get_value(parallel, Opts, erlang:system_info(schedulers)),
   {ProcessorPids, AllPids} = start_processors(NumProcessors),
-  read_chunks(FD, 0, 0, <<>>, BufSize, ProcessorPids),
+  {ok, Bin} = prim_file:pread(FD, 0, BufSize),
+  read_chunks(FD, 0, byte_size(Bin), Bin, BufSize, ProcessorPids),
   Now = erlang:monotonic_time(),
   logger:info(#{label => "All chunks read, waiting for processors to finish",
                 elapsed_secs => (Now - Start) / 1000_000_000.0}),
@@ -36,12 +37,10 @@ start_processors(NumProcs) ->
                 num_pipelines => NumProcs}),
   lists:foldl(
     fun(_, {ProcessorPids, AllPids}) ->
-        LineProcessorPid = proc_lib:start_link(?MODULE, line_processor, []),
         ProcessorPid = proc_lib:start_link(?MODULE, chunk_processor, []),
-        ProcessorPid ! {line_processor, LineProcessorPid},
-        LineProcessorPid ! {result_pid, self()},
+        ProcessorPid ! {result_pid, self()},
         {[ProcessorPid|ProcessorPids],
-         [ProcessorPid, LineProcessorPid|AllPids]}
+         [ProcessorPid|AllPids]}
     end, {[], []}, lists:seq(1, NumProcs)).
 
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
@@ -82,8 +81,8 @@ wait_for_completion(Pids, Map) ->
                     sender => SenderPid,
                     result_size => maps:size(NewMap)}),
       wait_for_completion(Pids, merge_location_data(Map, NewMap));
-    _ ->
-      logger:error(#{label => "Unexpected message"})
+    M ->
+      logger:error(#{label => "Unexpected message", msg => M})
   end.
 
 merge_location_data(Map1, Map2) ->
@@ -130,21 +129,36 @@ format_final_map(Map) ->
 chunk_processor() ->
   proc_lib:init_ack(self()),
   logger:info(#{label => "Chunk processor running"}),
-  chunk_processor_loop(undefined).
+    try
+        chunk_processor_loop(undefined)
+    catch E:R:ST ->
+            logger:error(#{ crashed => {E,R,ST} })
+    end.
 
 chunk_processor_loop(Pid) ->
   receive
-    {line_processor, LineProcessorPid} ->
-      chunk_processor_loop(LineProcessorPid);
+    {result_pid, NewPid} ->
+      chunk_processor_loop(NewPid);
     {chunk, [Chunk]} ->
-      Pid ! {lines, {binary:split(Chunk, [<<"\n">>, <<";">>], [global]), <<>>}},
+      process_station(Chunk),
       chunk_processor_loop(Pid);
     {chunk, [First, Second]} ->
-          Pid ! {lines, {binary:split(First, [<<"\n">>, <<";">>], [global]), Second}},
+          case process_station(First) of
+              <<>> ->
+                  ok;
+              {Rest, Station} ->
+                  process_temp(<<Rest/binary, Second/binary>>, Station);
+              Rest ->
+                  process_station(<<Rest/binary, Second/binary>>)
+          end,
       chunk_processor_loop(Pid);
     eof ->
-      logger:info(#{label => "Chunk processor finished."}),
-      Pid ! eof;
+      Map = maps:from_list(get()),
+      Pid ! {result, self(), Map},
+      {heap_size, HeapSize} = process_info(self(), heap_size),
+      logger:info(#{label => "Chunk processor finished",
+                    heap_size => HeapSize}),
+          ok;
     M ->
       logger:error(#{label => "Unexpected message", msg => M})
   end.
@@ -153,87 +167,107 @@ chunk_processor_loop(Pid) ->
 %% The line processor
 %%
 
-line_processor() ->
-  proc_lib:init_ack(self()),
-  line_processor_loop(undefined).
-
-line_processor_loop(ResultPid) ->
-  receive
-    {result_pid, Pid} ->
-      line_processor_loop(Pid);
-    {lines, {Lines, Tail}} ->
-      process_lines(Lines, Tail),
-      line_processor_loop(ResultPid);
-    eof ->
-      Map = maps:from_list(get()),
-      ResultPid ! {result, self(), Map},
-      {heap_size, HeapSize} = process_info(self(), heap_size),
-      logger:info(#{label => "Line processor finished",
-                    heap_size => HeapSize}),
-      ok;
-    M ->
-      logger:error(#{label => "Unexpected message", msg => M})
-  end.
-
-process_lines(Main, Tail) ->
-    case process_lines(Main) of
-        [] ->
-            <<>> = Tail,
-            ok;
-        Rest when Tail =/= <<>> ->
-            process_lines(Rest);
-        [Station] ->
-            process_lines(binary:split(<<Station/binary, Tail/binary>>, [<<";">>]));
-        [Station, Temp] ->
-            process_lines([Station, <<Temp/binary, Tail/binary>>])
-    end.
-process_lines([Station, TempBin|Rest]) when Rest =/= [] ->
-  Temp = parse_float(TempBin),
-  case get(Station) of
-    undefined ->
-      put(Station, { Temp % min
-                   , Temp % max
-                   , 1    % count
-                   , Temp % sum
-                   });
-
-    {OldMin, OldMax, OldCount, OldSum} ->
-      put(Station, { min(OldMin, Temp)
-                   , max(OldMax, Temp)
-                   , OldCount + 1
-                   , OldSum + Temp
-                   })
-
-  end,
-    process_lines(Rest);
-process_lines(Rest) ->
+process_station(<<Station:1/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:2/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:3/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:4/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:5/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:6/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:7/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:8/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:9/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:10/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:11/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:12/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:13/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:14/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:15/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:16/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:17/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:18/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:19/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:20/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:21/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:22/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:23/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:24/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:25/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:26/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:27/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:28/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:29/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(<<Station:30/binary,";",Rest/binary>>) ->
+    process_temp(Rest, Station);
+process_station(Rest) ->
+    %% %% Debug
+    %% case binary:split(Rest, [<<";">>]) of
+    %%     [Station, Temp] ->
+    %%         throw(Station);
+    %%     _ -> ok
+    %% end,
     Rest.
 
-
-%% Very specialized float-parser for floats with a single fractional
-%% digit, and returns the result as an integer * 10.
 -define(TO_NUM(C), (C - $0)).
 
-parse_float(<<$-, A, B, $., C>>) ->
-  -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C));
-parse_float(<<$-, B, $., C>>) ->
-  -1 * (?TO_NUM(B) * 10 + ?TO_NUM(C));
-parse_float(<<A, B, $., C>>) ->
-  ?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C);
-parse_float(<<B, $., C>>) ->
-  ?TO_NUM(B) * 10 + ?TO_NUM(C).
+process_temp(<<$-, A, B, $., C, Rest/binary>>, Station) ->
+    process_line(Rest, Station, -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C)));
+process_temp(<<$-, B, $., C, Rest/binary>>, Station) ->
+    process_line(Rest, Station, -1 * (?TO_NUM(B) * 10 + ?TO_NUM(C)));
+process_temp(<<A, B, $., C, Rest/binary>>, Station) ->
+    process_line(Rest, Station, ?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C));
+process_temp(<<B, $., C, Rest/binary>>, Station) ->
+    process_line(Rest, Station, ?TO_NUM(B) * 10 + ?TO_NUM(C));
+process_temp(Rest, Station) ->
+    {Rest, Station}.
 
--ifdef(TEST).
+process_line(Rest, Station, Temp) ->
+    case get(Station) of
+        undefined ->
+            put(Station, { Temp % min
+                         , Temp % max
+                         , 1    % count
+                         , Temp % sum
+                         });
 
-parse_float_test() ->
-  lists:foreach(fun({Bin, Exp}) ->
-                    Float = parse_float(Bin),
-                    ?debugVal({Bin, Float}),
-                    ?assert(abs(Exp - Float) =< 0.0001)
-                end,
-                [ {<<"-0.5">>, -5}
-                , {<<"-10.5">>, -105}
-                , {<<"10.5">>, 105}
-                ]).
+        {OldMin, OldMax, OldCount, OldSum} ->
+            put(Station, { min(OldMin, Temp)
+                         , max(OldMax, Temp)
+                         , OldCount + 1
+                         , OldSum + Temp
+                         })
 
--endif.
+    end,
+    case Rest of
+        <<>> -> <<>>;
+        <<"\n",NextStation/binary>> ->
+            process_station(NextStation)
+    end.
