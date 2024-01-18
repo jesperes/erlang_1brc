@@ -1,6 +1,7 @@
 -module(aggregate2).
 
--export([ aggregate_measurements/2
+-export([ run/1
+        , aggregate_measurements/2
         , chunk_processor/0
         ]).
 
@@ -8,16 +9,20 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+run([Filename]) ->
+    logger:update_primary_config(#{ level => none }),
+    aggregate_measurements(atom_to_list(Filename), [{bufsize, 2 * 1024 * 1240}]).
+
 aggregate_measurements(Filename, Opts) ->
   process_flag(trap_exit, true),
   Start = erlang:monotonic_time(),
   BufSize = proplists:get_value(bufsize, Opts),
   logger:info(#{bufsize => BufSize}),
-  {ok, FD} = prim_file:open(Filename, [read]),
+  {ok, FD} = file:open(Filename, [raw, read, binary]),
   NumProcessors =
     proplists:get_value(parallel, Opts, erlang:system_info(schedulers)),
   {ProcessorPids, AllPids} = start_processors(NumProcessors),
-  {ok, Bin} = prim_file:pread(FD, 0, BufSize),
+  {ok, Bin} = file:pread(FD, 0, BufSize),
   read_chunks(FD, 0, byte_size(Bin), Bin, BufSize, ProcessorPids),
   Now = erlang:monotonic_time(),
   logger:info(#{label => "All chunks read, waiting for processors to finish",
@@ -45,7 +50,7 @@ start_processors(NumProcs) ->
 
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids) ->
   TargetPid = lists:nth((N rem length(TargetPids)) + 1, TargetPids),
-  case prim_file:pread(FD, Offset, BufSize) of
+  case file:pread(FD, Offset, BufSize) of
     {ok, Bin} ->
       Size = byte_size(Bin),
       %% Read chunks pair-wise and split them so that each processed
@@ -167,74 +172,15 @@ chunk_processor_loop(Pid) ->
 %% The line processor
 %%
 
-process_station(<<Station:1/binary,";",Rest/binary>>) ->
+process_station(Station) ->
+    process_station(Station, Station, 0).
+process_station(Bin, <<";", Rest/bitstring>>, Cnt) ->
+    <<Station:Cnt/binary, _/bitstring>> = Bin,
     process_temp(Rest, Station);
-process_station(<<Station:2/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:3/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:4/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:5/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:6/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:7/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:8/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:9/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:10/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:11/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:12/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:13/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:14/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:15/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:16/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:17/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:18/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:19/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:20/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:21/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:22/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:23/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:24/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:25/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:26/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:27/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:28/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:29/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(<<Station:30/binary,";",Rest/binary>>) ->
-    process_temp(Rest, Station);
-process_station(Rest) ->
-    %% %% Debug
-    %% case binary:split(Rest, [<<";">>]) of
-    %%     [Station, Temp] ->
-    %%         throw(Station);
-    %%     _ -> ok
-    %% end,
-    Rest.
+process_station(Bin, <<_:8, Rest/bitstring>>, Cnt) ->
+    process_station(Bin, Rest, Cnt + 1);
+process_station(Bin, _, _Cnt) ->
+    Bin.
 
 -define(TO_NUM(C), (C - $0)).
 
