@@ -1,18 +1,18 @@
 -module(erlang_1brc).
 
--export([ main/1
-        , run/1
+-export([ main/1 %% Entrypoint for escript
+        , run/1  %% Entrypoint for run.sh
         ]).
 
--compile({inline,[{process_temp,2},{process_line,3}]}).
+-compile({inline, [ {process_temp,2}
+                  , {process_line,3}
+                  ]}).
 
 -define(BUFSIZE, 2 * 1024 * 1024).
 
 options() ->
   [ {file,      $f, "file",      {string, "measurements.txt"}, "The input file."}
   , {eprof,     $e, "eprof",     undefined,                    "Run code under eprof."}
-  , {bufsize,   $c, "bufsize",   {integer, 2 * 1024 * 1024},   "Buffer size."}
-  , {parallel,  $p, "parallel",  integer,                      "Number of parallel processing pipelines."}
   ].
 
 main(Args) ->
@@ -41,7 +41,8 @@ flush() ->
   logger_std_h:filesync(default).
 
 do_main(Opts) ->
-  run(proplists:get_value(file, Opts)).
+  {Time, _} = timer:tc(fun() -> run(proplists:get_value(file, Opts)) end),
+  Time.
 
 run([Filename]) ->
   run(Filename);
