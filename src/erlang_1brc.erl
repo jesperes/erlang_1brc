@@ -2,7 +2,6 @@
 
 -export([ main/1
         , run/1
-        , chunk_processor/0
         ]).
 
 -compile({inline,[{process_temp,2},{process_line,3}]}).
@@ -37,6 +36,10 @@ main(Args) ->
   io:format("Finished, time = ~w seconds~n",
             [erlang:convert_time_unit(Time, microsecond, second)]).
 
+%% Allow any logger events to be printed to console before exiting.
+flush() ->
+  logger_std_h:filesync(default).
+
 do_main(Opts) ->
   run(proplists:get_value(file, Opts)).
 
@@ -49,29 +52,40 @@ run(Filename) ->
     process_flag(trap_exit, true),
     case file:open(Filename, [raw, read, binary]) of
       {ok, FD} ->
-        NumProcessors = erlang:system_info(logical_processors),
-        {ProcessorPids, AllPids} = start_processors(NumProcessors),
+        ProcessorPids = start_processors(),
         {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
-        read_chunks(FD, 0, byte_size(Bin), Bin, ?BUFSIZE, ProcessorPids, NumProcessors * 3),
-        Map = wait_for_completion(AllPids, #{}),
+        read_chunks(FD, 0, byte_size(Bin), Bin, ?BUFSIZE, ProcessorPids, length(ProcessorPids) * 3),
+        Map = wait_for_completion(ProcessorPids, #{}),
         Fmt = format_final_map(Map),
         io:format("~ts~n", [Fmt]);
       {error, Reason} ->
         io:format("*** Failed to open ~ts: ~p~n", [Filename, Reason]),
+        flush(),
         erlang:halt(1)
     end
   catch Class:Error:Stacktrace ->
       io:format("*** Caught exception: ~p~n", [{Class, Error, Stacktrace}]),
+      flush(),
       erlang:halt(1)
   end.
 
-start_processors(NumProcs) ->
-  lists:foldl(
-    fun(_, Pids) ->
-        Pid = proc_lib:start_link(?MODULE, chunk_processor, []),
-        Pid ! {result_pid, self()},
-        [Pid|Pids]
-    end, [], lists:seq(1, NumProcs)).
+%% Wait for processors to finish
+wait_for_completion([], Map) ->
+  Map;
+wait_for_completion(Pids, Map) ->
+  receive
+    {'EXIT', Pid, normal} ->
+      wait_for_completion(Pids -- [Pid], Map);
+    {'EXIT', Pid, Other} ->
+      %% Rethrow non-normal exits, they will be caught in run/1
+      throw({unexpected_exit, Pid, Other});
+    {result, Data} ->
+      wait_for_completion(Pids, merge_location_data(Map, Data));
+    give_me_more ->
+      %% These are received when the chunk processors wants more data,
+      %% but we have already consumed the entire file.
+      wait_for_completion(Pids, Map)
+  end.
 
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids, 0) ->
   receive
@@ -102,20 +116,6 @@ read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids, Outstanding) ->
 
 send_chunk(Chunk, TargetPid) ->
   TargetPid ! {chunk, Chunk}.
-
-wait_for_completion([], Map) ->
-  Map;
-wait_for_completion(Pids, Map) ->
-  receive
-    {'EXIT', Pid, normal} ->
-      wait_for_completion(Pids -- [Pid], Map);
-    {result, _SenderPid, NewMap} ->
-      wait_for_completion(Pids, merge_location_data(Map, NewMap));
-    give_me_more ->
-      wait_for_completion(Pids, Map);
-    M ->
-      logger:error(#{label => "Unexpected message", msg => M})
-  end.
 
 merge_location_data(Map1, Map2) ->
   Stations = lists:usort(maps:keys(Map1) ++ maps:keys(Map2)),
@@ -153,49 +153,43 @@ format_final_map(Map) ->
         end, lists:sort(maps:to_list(Map))))
     ++ "}".
 
-%%
-%% Chunk processor: this step in the pipeline takes a binary
-%% consisting of an even number of line, splits it at "\n" and ";" and
-%% passes it on to the line processor.
-%%
-chunk_processor() ->
-  proc_lib:init_ack(self()),
-    try
-        chunk_processor_loop(undefined)
-    catch E:R:ST ->
-            logger:error(#{ crashed => {E,R,ST} })
-    end.
 
-chunk_processor_loop(Pid) ->
+%% Chunk processor. Receives chunks from the main process, and parses
+%% them into temperatures.
+start_processors() ->
+  start_processors(erlang:system_info(logical_processors)).
+
+start_processors(NumProcs) ->
+  Self = self(),
+  lists:foldl(
+    fun(_, Pids) ->
+        [spawn_link(fun() -> chunk_processor(Self) end)|Pids]
+    end, [], lists:seq(1, NumProcs)).
+
+chunk_processor(Pid) ->
   receive
-    {result_pid, NewPid} ->
-      chunk_processor_loop(NewPid);
     {chunk, [Chunk]} ->
       process_station(Chunk),
           Pid ! give_me_more,
-      chunk_processor_loop(Pid);
+      chunk_processor(Pid);
     {chunk, [First, Second]} ->
-          case process_station(First) of
-              <<>> ->
-                  ok;
-              {Rest, Station} ->
-                  process_temp(<<Rest/binary, Second/binary>>, Station);
-              Rest ->
-                  process_station(<<Rest/binary, Second/binary>>)
-          end,
-          Pid ! give_me_more,
-      chunk_processor_loop(Pid);
+      case process_station(First) of
+        <<>> ->
+          ok;
+        {Rest, Station} ->
+          process_temp(<<Rest/binary, Second/binary>>, Station);
+        Rest ->
+          process_station(<<Rest/binary, Second/binary>>)
+      end,
+      Pid ! give_me_more,
+      chunk_processor(Pid);
     eof ->
       Map = maps:from_list(get()),
-      Pid ! {result, self(), Map},
+      Pid ! {result, Map},
       ok;
-    M ->
-      io:format("Unexpected message: ~w~n", [M])
+    Other ->
+      throw({unexpected_message, self(), Other})
   end.
-
-%%
-%% The line processor
-%%
 
 process_station(Station) ->
     process_station(Station, Station, 0).
@@ -207,8 +201,9 @@ process_station(Bin, <<_:8, Rest/bitstring>>, Cnt) ->
 process_station(Bin, _, _Cnt) ->
     Bin.
 
+%% Specialized float parser for 2-digit floats with one fractional
+%% digit.
 -define(TO_NUM(C), (C - $0)).
-
 process_temp(<<$-, A, B, $., C, Rest/binary>>, Station) ->
     process_line(Rest, Station, -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C)));
 process_temp(<<$-, B, $., C, Rest/binary>>, Station) ->
