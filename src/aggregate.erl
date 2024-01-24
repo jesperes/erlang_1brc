@@ -1,12 +1,17 @@
 -module(aggregate).
 
--export([ aggregate_measurements/2
+-export([ run/1
+        , aggregate_measurements/2
         , chunk_processor/0
         , line_processor/0
         , parse_float/1
         ]).
 
 -include_lib("eunit/include/eunit.hrl").
+
+run([Filename]) ->
+%    logger:update_primary_config(#{ level => none }),
+    aggregate_measurements(atom_to_list(Filename), [{bufsize, 2 * 1024 * 1024}]).
 
 aggregate_measurements(Filename, Opts) ->
   process_flag(trap_exit, true),
