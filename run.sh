@@ -6,7 +6,7 @@ if [ -z "$INPUT" ]; then
 fi
 
 erlc src/erlang_1brc.erl
-/bin/time -f "Elapsed time: %E" \
+/bin/time -f "Elapsed time: %e seconds (%E)" \
     erl \
     +SDio 1 \
     +SDPcpu 50 \

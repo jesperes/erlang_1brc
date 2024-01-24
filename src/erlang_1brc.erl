@@ -67,18 +67,17 @@ run(Filename) ->
 
 start_processors(NumProcs) ->
   lists:foldl(
-    fun(_, {ProcessorPids, AllPids}) ->
-        ProcessorPid = proc_lib:start_link(?MODULE, chunk_processor, []),
-        ProcessorPid ! {result_pid, self()},
-        {[ProcessorPid|ProcessorPids],
-         [ProcessorPid|AllPids]}
-    end, {[], []}, lists:seq(1, NumProcs)).
+    fun(_, Pids) ->
+        Pid = proc_lib:start_link(?MODULE, chunk_processor, []),
+        Pid ! {result_pid, self()},
+        [Pid|Pids]
+    end, [], lists:seq(1, NumProcs)).
 
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids, 0) ->
-    receive
-        give_me_more ->
-            read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids, 1)
-    end;
+  receive
+    give_me_more ->
+      read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids, 1)
+  end;
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids, Outstanding) ->
   TargetPid = lists:nth((N rem length(TargetPids)) + 1, TargetPids),
   case file:pread(FD, Offset, BufSize) of
@@ -112,8 +111,8 @@ wait_for_completion(Pids, Map) ->
       wait_for_completion(Pids -- [Pid], Map);
     {result, _SenderPid, NewMap} ->
       wait_for_completion(Pids, merge_location_data(Map, NewMap));
-      give_me_more ->
-          wait_for_completion(Pids, Map);
+    give_me_more ->
+      wait_for_completion(Pids, Map);
     M ->
       logger:error(#{label => "Unexpected message", msg => M})
   end.
