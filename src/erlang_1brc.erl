@@ -40,16 +40,30 @@ main(Args) ->
 do_main(Opts) ->
   run(proplists:get_value(file, Opts)).
 
+run([Filename]) ->
+  run(Filename);
+run(Filename) when is_atom(Filename) ->
+  run(atom_to_list(Filename));
 run(Filename) ->
-  process_flag(trap_exit, true),
-  {ok, FD} = file:open(Filename, [raw, read, binary]),
-  NumProcessors = erlang:system_info(logical_processors),
-  {ProcessorPids, AllPids} = start_processors(NumProcessors),
-  {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
-  read_chunks(FD, 0, byte_size(Bin), Bin, ?BUFSIZE, ProcessorPids, NumProcessors * 3),
-  Map = wait_for_completion(AllPids, #{}),
-  Fmt = format_final_map(Map),
-  io:format("~ts~n", [Fmt]).
+  try
+    process_flag(trap_exit, true),
+    case file:open(Filename, [raw, read, binary]) of
+      {ok, FD} ->
+        NumProcessors = erlang:system_info(logical_processors),
+        {ProcessorPids, AllPids} = start_processors(NumProcessors),
+        {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
+        read_chunks(FD, 0, byte_size(Bin), Bin, ?BUFSIZE, ProcessorPids, NumProcessors * 3),
+        Map = wait_for_completion(AllPids, #{}),
+        Fmt = format_final_map(Map),
+        io:format("~ts~n", [Fmt]);
+      {error, Reason} ->
+        io:format("*** Failed to open ~ts: ~p~n", [Filename, Reason]),
+        erlang:halt(1)
+    end
+  catch Class:Error:Stacktrace ->
+      io:format("*** Caught exception: ~p~n", [{Class, Error, Stacktrace}]),
+      erlang:halt(1)
+  end.
 
 start_processors(NumProcs) ->
   lists:foldl(
