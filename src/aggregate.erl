@@ -1,35 +1,23 @@
 -module(aggregate).
 
 -export([ run/1
-        , aggregate_measurements/2
         , chunk_processor/0
         ]).
 
 -compile({inline,[{process_temp,2},{process_line,3}]}).
 
+-define(BUFSIZE, 2 * 1024 * 1024).
+
 run([Filename]) ->
-    logger:update_primary_config(#{ level => none }),
-    aggregate_measurements(atom_to_list(Filename), [{bufsize, 2 * 1024 * 1240}]).
-
-aggregate_measurements(Filename, Opts) ->
   process_flag(trap_exit, true),
-  BufSize = proplists:get_value(bufsize, Opts),
-  logger:info(#{bufsize => BufSize}),
   {ok, FD} = file:open(Filename, [raw, read, binary]),
-  NumProcessors =
-    proplists:get_value(parallel, Opts, erlang:system_info(schedulers)),
+  NumProcessors = erlang:system_info(logical_processors),
   {ProcessorPids, AllPids} = start_processors(NumProcessors),
-  {ok, Bin} = file:pread(FD, 0, BufSize),
-  read_chunks(FD, 0, byte_size(Bin), Bin, BufSize, ProcessorPids, NumProcessors * 3),
+  {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
+  read_chunks(FD, 0, byte_size(Bin), Bin, ?BUFSIZE, ProcessorPids, NumProcessors * 3),
   Map = wait_for_completion(AllPids, #{}),
-
-  %% ?assertMatch({_, 180, _, _}, maps:get(<<"Abha">>, Map)),
   Fmt = format_final_map(Map),
-  case proplists:get_value(no_output, Opts, false) of
-    true -> ok;
-    false ->
-      io:format("~ts~n", [Fmt])
-  end.
+  io:format("~ts~n", [Fmt]).
 
 start_processors(NumProcs) ->
   lists:foldl(
