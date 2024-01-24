@@ -169,9 +169,10 @@ start_processors(NumProcs) ->
 
 chunk_processor(Pid) ->
   receive
+    %% This only happens on the very last line.
     {chunk, [Chunk]} ->
       process_station(Chunk),
-          Pid ! give_me_more,
+      Pid ! give_me_more,
       chunk_processor(Pid);
     {chunk, [First, Second]} ->
       case process_station(First) of
@@ -193,48 +194,41 @@ chunk_processor(Pid) ->
   end.
 
 process_station(Station) ->
-    process_station(Station, Station, 0).
+  process_station(Station, Station, 0).
 process_station(Bin, <<";", Rest/bitstring>>, Cnt) ->
-    <<Station:Cnt/binary, _/bitstring>> = Bin,
-    process_temp(Rest, Station);
+  <<Station:Cnt/binary, _/bitstring>> = Bin,
+  process_temp(Rest, Station);
 process_station(Bin, <<_:8, Rest/bitstring>>, Cnt) ->
-    process_station(Bin, Rest, Cnt + 1);
+  process_station(Bin, Rest, Cnt + 1);
 process_station(Bin, _, _Cnt) ->
-    Bin.
+  Bin.
 
 %% Specialized float parser for 2-digit floats with one fractional
 %% digit.
 -define(TO_NUM(C), (C - $0)).
 process_temp(<<$-, A, B, $., C, Rest/binary>>, Station) ->
-    process_line(Rest, Station, -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C)));
+  process_line(Rest, Station, -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C)));
 process_temp(<<$-, B, $., C, Rest/binary>>, Station) ->
-    process_line(Rest, Station, -1 * (?TO_NUM(B) * 10 + ?TO_NUM(C)));
+  process_line(Rest, Station, -1 * (?TO_NUM(B) * 10 + ?TO_NUM(C)));
 process_temp(<<A, B, $., C, Rest/binary>>, Station) ->
-    process_line(Rest, Station, ?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C));
+  process_line(Rest, Station, ?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C));
 process_temp(<<B, $., C, Rest/binary>>, Station) ->
-    process_line(Rest, Station, ?TO_NUM(B) * 10 + ?TO_NUM(C));
+  process_line(Rest, Station, ?TO_NUM(B) * 10 + ?TO_NUM(C));
 process_temp(Rest, Station) ->
-    {Rest, Station}.
+  {Rest, Station}.
 
 process_line(Rest, Station, Temp) ->
-    case get(Station) of
-        undefined ->
-            put(Station, { Temp % min
-                         , Temp % max
-                         , 1    % count
-                         , Temp % sum
-                         });
-
-        {OldMin, OldMax, OldCount, OldSum} ->
-            put(Station, { min(OldMin, Temp)
-                         , max(OldMax, Temp)
-                         , OldCount + 1
-                         , OldSum + Temp
-                         })
-
-    end,
-    case Rest of
-        <<>> -> <<>>;
-        <<"\n",NextStation/binary>> ->
-            process_station(NextStation)
-    end.
+  case get(Station) of
+    undefined ->
+      put(Station, {Temp, Temp, 1, Temp});
+    {OldMin, OldMax, OldCount, OldSum} ->
+      put(Station, {min(OldMin, Temp),
+                    max(OldMax, Temp),
+                    OldCount + 1,
+                    OldSum + Temp})
+  end,
+  case Rest of
+    <<>> -> <<>>;
+    <<"\n",NextStation/binary>> ->
+      process_station(NextStation)
+  end.
