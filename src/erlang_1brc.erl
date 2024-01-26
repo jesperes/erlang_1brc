@@ -49,6 +49,10 @@ run([Filename]) ->
 run(Filename) when is_atom(Filename) ->
   run(atom_to_list(Filename));
 run(Filename) ->
+  {Time, _} = timer:tc(fun() -> map_cities(Filename) end),
+  io:format("Mapped ~p citites in ~w ms~n",
+            [length(get()),
+             erlang:convert_time_unit(Time, microsecond, millisecond)]),
   try
     process_flag(trap_exit, true),
     case file:open(Filename, [raw, read, binary]) of
@@ -68,6 +72,48 @@ run(Filename) ->
       io:format("*** Caught exception: ~p~n", [{Class, Error, Stacktrace}]),
       flush(),
       erlang:halt(1)
+  end.
+
+map_cities(Filename) ->
+  case file:open(Filename, [raw, read, binary]) of
+    {ok, FD} ->
+      {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
+      map_cities0(Bin, 1);
+    {error, Reason} ->
+      io:format("*** Failed to open ~ts: ~p~n", [Filename, Reason]),
+      flush(),
+      erlang:halt(1)
+  end.
+
+-define(KEY(C, Acc), ((C * 17) bxor Acc) bsl 1).
+
+station_key(Station) ->
+  lists:foldl(fun(C, Acc) -> ?KEY(C, Acc) end,
+              0, binary_to_list(Station)).
+
+map_cities0(<<>>, _) ->
+  ok;
+map_cities0(Bin, N) ->
+  case binary:split(Bin, <<"\n">>) of
+    [First, Rest] ->
+      case binary:split(First, <<";">>) of
+        [Station, _] ->
+          Key = station_key(Station),
+
+          case get({key, Key}) of
+            undefined ->
+              put({key, Key}, {station, Station}),
+              map_cities0(Rest, N + 1);
+            {station, Clash} when Clash =/= Station ->
+              throw({name_clash, Key, Station, Clash});
+            _ ->
+              map_cities0(Rest, N + 1)
+          end;
+        _ ->
+          ok
+      end;
+    _ ->
+      ok
   end.
 
 %% Wait for processors to finish
@@ -146,12 +192,18 @@ format_final_map(Map) ->
   "{" ++
     lists:join(
       ", ",
-      lists:map(
+      lists:sort(lists:map(
         fun({Station, {Min, Max, Count, Sum}}) ->
             Mean = Sum / Count,
-            io_lib:format("~ts=~.1f/~.1f/~.1f",
-                          [Station, Min/10, Mean/10, Max/10])
-        end, lists:sort(maps:to_list(Map))))
+            case get({key, Station}) of
+              {station, StationBin} ->
+                io_lib:format("~ts=~.1f/~.1f/~.1f",
+                              [StationBin, Min/10, Mean/10, Max/10]);
+              Other ->
+                io:format("~p~n", [get()]),
+                throw({failed_to_lookup_station, Other, Station})
+            end
+        end, maps:to_list(Map))))
     ++ "}".
 
 
@@ -194,13 +246,13 @@ chunk_processor(Pid) ->
   end.
 
 process_station(Station) ->
-  process_station(Station, Station, 0).
-process_station(Bin, <<";", Rest/bitstring>>, Cnt) ->
-  <<Station:Cnt/binary, _/bitstring>> = Bin,
+  process_station(Station, 0).
+
+process_station(<<";", Rest/bitstring>>, Station) ->
   process_temp(Rest, Station);
-process_station(Bin, <<_:8, Rest/bitstring>>, Cnt) ->
-  process_station(Bin, Rest, Cnt + 1);
-process_station(Bin, _, _Cnt) ->
+process_station(<<C:8, Rest/bitstring>>, StationKey) ->
+  process_station(Rest, ?KEY(C, StationKey));
+process_station(Bin, _) ->
   Bin.
 
 %% Specialized float parser for 2-digit floats with one fractional
@@ -217,15 +269,15 @@ process_temp(<<B, $., C, Rest/binary>>, Station) ->
 process_temp(Rest, Station) ->
   {Rest, Station}.
 
-process_line(Rest, Station, Temp) ->
-  case get(Station) of
+process_line(Rest, Key, Temp) ->
+  case get(Key) of
     undefined ->
-      put(Station, {Temp, Temp, 1, Temp});
+      put(Key, {Temp, Temp, 1, Temp});
     {OldMin, OldMax, OldCount, OldSum} ->
-      put(Station, {min(OldMin, Temp),
-                    max(OldMax, Temp),
-                    OldCount + 1,
-                    OldSum + Temp})
+      put(Key, {min(OldMin, Temp),
+                max(OldMax, Temp),
+                OldCount + 1,
+                OldSum + Temp})
   end,
   case Rest of
     <<>> -> <<>>;
