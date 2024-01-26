@@ -3,6 +3,9 @@
 Erlang implementation of the [One Billion Row
 Challenge](https://www.morling.dev/blog/one-billion-row-challenge/).
 
+This is included in the set of Elixir/Erlang implementations discussed
+here: https://github.com/gunnarmorling/1brc/discussions/93.
+
 ## Usage (rebar3)
 
 ```shell
