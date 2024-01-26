@@ -1,5 +1,7 @@
 -module(erlang_1brc).
 
+-feature(maybe_expr, enable).
+
 -export([ main/1 %% Entrypoint for escript
         , run/1  %% Entrypoint for run.sh
         ]).
@@ -94,26 +96,19 @@ station_key(Station) ->
 map_cities0(<<>>, _) ->
   ok;
 map_cities0(Bin, N) ->
-  case binary:split(Bin, <<"\n">>) of
-    [First, Rest] ->
-      case binary:split(First, <<";">>) of
-        [Station, _] ->
-          Key = station_key(Station),
-
-          case get({key, Key}) of
-            undefined ->
-              put({key, Key}, {station, Station}),
-              map_cities0(Rest, N + 1);
-            {station, Clash} when Clash =/= Station ->
-              throw({name_clash, Key, Station, Clash});
-            _ ->
-              map_cities0(Rest, N + 1)
-          end;
-        _ ->
-          ok
-      end;
-    _ ->
-      ok
+  maybe
+    [First, Rest] ?= binary:split(Bin, <<"\n">>),
+    [Station, _] ?= binary:split(First, <<";">>),
+    Key = station_key(Station),
+    case get({key, Key}) of
+      undefined ->
+        put({key, Key}, {station, Station}),
+        map_cities0(Rest, N + 1);
+      {station, Clash} when Clash =/= Station ->
+        throw({name_clash, Key, Station, Clash});
+      _ ->
+        map_cities0(Rest, N + 1)
+    end
   end.
 
 %% Wait for processors to finish
