@@ -1,16 +1,27 @@
 -module(erlang_1brc).
 
+-include_lib("stdlib/include/assert.hrl").
+
 -feature(maybe_expr, enable).
 
 -export([ main/1 %% Entrypoint for escript
         , run/1  %% Entrypoint for run.sh
         ]).
 
--compile({inline, [ {process_temp,2}
-                  , {process_line,3}
+-compile({inline, [ {process_temp, 2}
+                  , {process_line, 3}
+                  , {process_station, 2}
                   ]}).
 
 -define(BUFSIZE, 2 * 1024 * 1024).
+
+%% 64k seems to be the smallest buffer we can read and still get all
+%% the city names. This should be computed dynamically instead.
+-define(MAP_CITIES_BUFSIZE, 64 * 1024).
+-define(EXPECTED_NUM_CITIES, 413).
+
+%% Compute a compressed key one byte at a time
+-define(KEY(C, Acc), ((C * 17) bxor Acc) bsl 1).
 
 options() ->
   [ {file,      $f, "file",      {string, "measurements.txt"}, "The input file."}
@@ -52,9 +63,10 @@ run(Filename) when is_atom(Filename) ->
   run(atom_to_list(Filename));
 run(Filename) ->
   {Time, _} = timer:tc(fun() -> map_cities(Filename) end),
+  NumCities = length(get()),
+  ?assertEqual(?EXPECTED_NUM_CITIES, NumCities),
   io:format("Mapped ~p citites in ~w ms~n",
-            [length(get()),
-             erlang:convert_time_unit(Time, microsecond, millisecond)]),
+            [NumCities, erlang:convert_time_unit(Time, microsecond, millisecond)]),
   try
     process_flag(trap_exit, true),
     case file:open(Filename, [raw, read, binary]) of
@@ -79,15 +91,13 @@ run(Filename) ->
 map_cities(Filename) ->
   case file:open(Filename, [raw, read, binary]) of
     {ok, FD} ->
-      {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
+      {ok, Bin} = file:pread(FD, 0, ?MAP_CITIES_BUFSIZE),
       map_cities0(Bin, 1);
     {error, Reason} ->
       io:format("*** Failed to open ~ts: ~p~n", [Filename, Reason]),
       flush(),
       erlang:halt(1)
   end.
-
--define(KEY(C, Acc), ((C * 17) bxor Acc) bsl 1).
 
 station_key(Station) ->
   lists:foldl(fun(C, Acc) -> ?KEY(C, Acc) end,
@@ -245,8 +255,8 @@ process_station(Station) ->
 
 process_station(<<";", Rest/bitstring>>, Station) ->
   process_temp(Rest, Station);
-process_station(<<C:8, Rest/bitstring>>, StationKey) ->
-  process_station(Rest, ?KEY(C, StationKey));
+process_station(<<C:8, Rest/bitstring>>, Station) ->
+  process_station(Rest, ?KEY(C, Station)); %% magic happens here
 process_station(Bin, _) ->
   Bin.
 
@@ -262,6 +272,10 @@ process_temp(<<A, B, $., C, Rest/binary>>, Station) ->
 process_temp(<<B, $., C, Rest/binary>>, Station) ->
   process_line(Rest, Station, ?TO_NUM(B) * 10 + ?TO_NUM(C));
 process_temp(Rest, Station) ->
+  %% This return breaks the match context reuse optimization, but it
+  %% is only executed at the end of each chunk, so it doesn't really
+  %% matter much. The first four clauses here are the hot ones, together
+  %% with the two first ones in process_station/2.
   {Rest, Station}.
 
 process_line(Rest, Key, Temp) ->
