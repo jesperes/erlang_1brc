@@ -6,7 +6,8 @@ if [ -z "$INPUT" ]; then
 fi
 
 set -e
-erlc -W src/erlang_1brc.erl
+# erlc +bin_opt_info -W src/erlang_1brc.erl
+erlc -W src/erlang_1brc.erl || exit 1
 /bin/time -f "Elapsed time: %e seconds (%E)" \
     erl \
     -noinput \
