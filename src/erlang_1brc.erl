@@ -8,20 +8,55 @@
         , run/1  %% Entrypoint for run.sh
         ]).
 
+%% These inlinings are actually necessary. On my machine, it yields a
+%% 15-20% performance improvement.
 -compile({inline, [ {process_temp, 2}
                   , {process_line, 3}
                   , {process_station, 2}
                   ]}).
 
+%% This is the size of the chunks we read from the input file at a
+%% time.  There is some overhead "stitching" buffers together, so this
+%% should be large enough to keep the worker threads busy in the
+%% process_* functions.
 -define(BUFSIZE, 2 * 1024 * 1024).
 
-%% 64k seems to be the smallest buffer we can read and still get all
-%% the city names. This should be computed dynamically instead.
--define(MAP_CITIES_BUFSIZE, 64 * 1024).
--define(EXPECTED_NUM_CITIES, 413).
-
-%% Compute a compressed key one byte at a time
+%% We pre-compute a mapping using the `KEY' macro from cities to
+%% (smallish) integers and store in the process dictionary. When we
+%% iterate over the chunks, matching binaries as we go, this mapping
+%% is such that it can be computed byte-by-byte, so we do not need to
+%% keep the entire city name around. This makes it easier to leverage
+%% the "match context reuse" optimization, as we do not need any
+%% "look-back" to extract the station name once we reach the ";".
+%%
+%% The formula is totally non-scientific, but it seems to work well in
+%% practise.
+%%
+%% For the large inputs, the loop in `process_station/2' turns out to
+%% be the really hot part, and the match-context reuse optimization
+%% almost halves the total runtime.
 -define(KEY(C, Acc), ((C * 17) bxor Acc) bsl 1).
+
+%% The worker threads will produce a map of #{Key => TempData} where
+%% the key is an integer (see the `KEY' macro). To be able to convert
+%% the key back into a station name, we compute the mapping between
+%% keys and their station name upfront by reading a single chunk of
+%% size `MAP_CITIES_BUFSIZE'. This should be large enough to include
+%% all citites, but small enough such the scanning of it is several
+%% magnitudes faster than the the total runtime.
+%%
+%% For my 1B-file, 64k seems to be the smallest buffer we can read and
+%% still get all the city names.
+%%
+%% TODO Compute this dynamically instead. This can be done once we
+%% have collected all the temperature data; we can then scan the file
+%% from the beginning until we have found stations for all the keys
+%% used in the temperature data map.
+-define(MAP_CITIES_BUFSIZE, 64 * 1024).
+
+%% Just as a precaution, check that we have actually found all the
+%% cities.
+-define(EXPECTED_NUM_CITIES, 413).
 
 options() ->
   [ {file,      $f, "file",      {string, "measurements.txt"}, "The input file."}
@@ -219,6 +254,7 @@ start_processors() ->
 
 start_processors(NumProcs) ->
   Self = self(),
+  io:format("Starting ~p parallell chunk processors~n", [NumProcs]),
   lists:foldl(
     fun(_, Pids) ->
         [spawn_link(fun() -> chunk_processor(Self) end)|Pids]
