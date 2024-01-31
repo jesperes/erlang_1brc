@@ -188,11 +188,18 @@ start_workers() ->
   start_workers(erlang:system_info(logical_processors)).
 
 start_workers(NumProcs) ->
+  process_flag(message_queue_data, off_heap),
+  process_flag(priority, high),
+  Options = [link,
+             {min_heap_size, 1024*1024},
+             {min_bin_vheap_size, 1024*1024},
+             {max_heap_size, (1 bsl 59) -1}
+            ],
   Self = self(),
   io:format("Starting ~p parallel workers~n", [NumProcs]),
   lists:foldl(
     fun(_, Pids) ->
-        [spawn_link(fun() -> worker_loop(Self) end)|Pids]
+        [spawn_opt(fun() -> worker_loop(Self) end, Options)|Pids]
     end, [], lists:seq(1, NumProcs)).
 
 worker_loop(Pid) ->
