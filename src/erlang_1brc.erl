@@ -1,12 +1,8 @@
 -module(erlang_1brc).
 
--include_lib("stdlib/include/assert.hrl").
-
 -feature(maybe_expr, enable).
 
--export([ main/1 %% Entrypoint for escript
-        , run/1  %% Entrypoint for run.sh
-        ]).
+-export([main/1]).
 
 %% These inlinings are actually necessary. On my machine, it yields a
 %% 15-20% performance improvement.
@@ -21,142 +17,39 @@
 %% process_* functions.
 -define(BUFSIZE, 2 * 1024 * 1024).
 
-%% We pre-compute a mapping using the `KEY' macro from cities to
-%% (smallish) integers and store in the process dictionary. When we
-%% iterate over the chunks, matching binaries as we go, this mapping
-%% is such that it can be computed byte-by-byte, so we do not need to
-%% keep the entire city name around. This makes it easier to leverage
-%% the "match context reuse" optimization, as we do not need any
-%% "look-back" to extract the station name once we reach the ";".
-%%
-%% The formula is totally non-scientific, but it seems to work well in
-%% practise.
-%%
-%% For the large inputs, the loop in `process_station/2' turns out to
-%% be the really hot part, and the match-context reuse optimization
-%% almost halves the total runtime.
--define(KEY(C, Acc), ((C * 17) bxor Acc) bsl 1).
-
-%% The worker threads will produce a map of #{Key => TempData} where
-%% the key is an integer (see the `KEY' macro). To be able to convert
-%% the key back into a station name, we compute the mapping between
-%% keys and their station name upfront by reading a single chunk of
-%% size `MAP_CITIES_BUFSIZE'. This should be large enough to include
-%% all citites, but small enough such the scanning of it is several
-%% magnitudes faster than the the total runtime.
-%%
-%% For my 1B-file, 64k seems to be the smallest buffer we can read and
-%% still get all the city names.
-%%
-%% TODO Compute this dynamically instead. This can be done once we
-%% have collected all the temperature data; we can then scan the file
-%% from the beginning until we have found stations for all the keys
-%% used in the temperature data map.
--define(MAP_CITIES_BUFSIZE, 64 * 1024).
-
-%% Just as a precaution, check that we have actually found all the
-%% cities.
--define(EXPECTED_NUM_CITIES, 413).
-
-options() ->
-  [ {file,      $f, "file",      {string, "measurements.txt"}, "The input file."}
-  , {eprof,     $e, "eprof",     undefined,                    "Run code under eprof."}
-  ].
+input_filename([Filename]) ->
+  Filename;
+input_filename([]) ->
+  "measurements.txt".
 
 main(Args) ->
-  {ok, {Opts, []}} = getopt:parse(options(), Args),
-
-  Time =
-    case proplists:get_value(eprof, Opts) of
-      true ->
-        logger:info(#{label => "Enabling eprof"}),
-        eprof:start(),
-        eprof:start_profiling(erlang:processes()),
-        T = do_main(Opts),
-        eprof:stop_profiling(),
-        eprof:analyze(),
-        eprof:stop(),
-        T;
-      _ ->
-        do_main(Opts)
-    end,
-
-  io:format("Finished, time = ~w seconds~n",
-            [erlang:convert_time_unit(Time, microsecond, second)]).
-
-%% Allow any logger events to be printed to console before exiting.
-flush() ->
-  logger_std_h:filesync(default).
-
-do_main(Opts) ->
-  {Time, _} = timer:tc(fun() -> run(proplists:get_value(file, Opts)) end),
+  {Time, _} = timer:tc(fun() -> run(input_filename(Args)) end),
+  io:format("Elapsed: ~f seconds~n", [Time / 1000000.0]),
   Time.
 
-run([Filename]) ->
-  run(Filename);
-run(Filename) when is_atom(Filename) ->
-  run(atom_to_list(Filename));
 run(Filename) ->
-  {Time, _} = timer:tc(fun() -> map_cities(Filename) end),
-  NumCities = length(get()),
-  ?assertEqual(?EXPECTED_NUM_CITIES, NumCities),
-  io:format("Mapped ~p citites in ~w ms~n",
-            [NumCities, erlang:convert_time_unit(Time, microsecond, millisecond)]),
-  try
-    process_flag(trap_exit, true),
-    case file:open(Filename, [raw, read, binary]) of
-      {ok, FD} ->
-        ProcessorPids = start_processors(),
-        {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
-        read_chunks(FD, 0, byte_size(Bin), Bin, ?BUFSIZE, ProcessorPids, length(ProcessorPids) * 3),
-        Map = wait_for_completion(ProcessorPids, #{}),
-        Fmt = format_final_map(Map),
-        io:format("~ts~n", [Fmt]);
-      {error, Reason} ->
-        io:format("*** Failed to open ~ts: ~p~n", [Filename, Reason]),
-        flush(),
-        erlang:halt(1)
-    end
-  catch Class:Error:Stacktrace ->
-      io:format("*** Caught exception: ~p~n", [{Class, Error, Stacktrace}]),
-      flush(),
-      erlang:halt(1)
-  end.
+  process_flag(trap_exit, true),
+  Workers = start_workers(),
+  read_chunks(Filename, Workers),
+  io:format("Finished reading input file, waiting for workers to finish.~n", []),
+  Map = wait_for_completion(Workers, #{}),
+  print_results(Map).
 
-map_cities(Filename) ->
-  case file:open(Filename, [raw, read, binary]) of
-    {ok, FD} ->
-      {ok, Bin} = file:pread(FD, 0, ?MAP_CITIES_BUFSIZE),
-      map_cities0(Bin, 1);
-    {error, Reason} ->
-      io:format("*** Failed to open ~ts: ~p~n", [Filename, Reason]),
-      flush(),
-      erlang:halt(1)
-  end.
+print_results(Map) ->
+  Str = "{" ++
+    lists:join(
+      ", ",
+      lists:sort(lists:map(
+        fun({Station, {Min, Max, Count, Sum}}) ->
+            Mean = Sum / Count,
+            Station0 = list_to_binary(lists:reverse(binary_to_list(Station))),
+            io_lib:format("~ts=~.1f/~.1f/~.1f",
+                          [Station0, Min/10, Mean/10, Max/10])
+        end, maps:to_list(Map))))
+    ++ "}",
+  io:format("~ts~n", [Str]).
 
-station_key(Station) ->
-  lists:foldl(fun(C, Acc) -> ?KEY(C, Acc) end,
-              0, binary_to_list(Station)).
-
-map_cities0(<<>>, _) ->
-  ok;
-map_cities0(Bin, N) ->
-  maybe
-    [First, Rest] ?= binary:split(Bin, <<"\n">>),
-    [Station, _] ?= binary:split(First, <<";">>),
-    Key = station_key(Station),
-    case get({key, Key}) of
-      undefined ->
-        put({key, Key}, {station, Station}),
-        map_cities0(Rest, N + 1);
-      {station, Clash} when Clash =/= Station ->
-        throw({name_clash, Key, Station, Clash});
-      _ ->
-        map_cities0(Rest, N + 1)
-    end
-  end.
-
-%% Wait for processors to finish
+%% Wait for workers to finish
 wait_for_completion([], Map) ->
   Map;
 wait_for_completion(Pids, Map) ->
@@ -169,10 +62,15 @@ wait_for_completion(Pids, Map) ->
     {result, Data} ->
       wait_for_completion(Pids, merge_location_data(Map, Data));
     give_me_more ->
-      %% These are received when the chunk processors wants more data,
-      %% but we have already consumed the entire file.
+      %% These are received when the workers wants more data, but we
+      %% have already consumed the entire file.
       wait_for_completion(Pids, Map)
   end.
+
+read_chunks(Filename, Workers) ->
+  {ok, FD} = file:open(Filename, [raw, read, binary]),
+  {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
+  read_chunks(FD, 0, byte_size(Bin), Bin, ?BUFSIZE, Workers, length(Workers) * 3).
 
 read_chunks(FD, N, Offset, PrevChunk, BufSize, TargetPids, 0) ->
   receive
@@ -228,45 +126,25 @@ merge_location_data(Map1, Map2) ->
         end
     end, #{}, Stations).
 
-format_final_map(Map) ->
-  "{" ++
-    lists:join(
-      ", ",
-      lists:sort(lists:map(
-        fun({Station, {Min, Max, Count, Sum}}) ->
-            Mean = Sum / Count,
-            case get({key, Station}) of
-              {station, StationBin} ->
-                io_lib:format("~ts=~.1f/~.1f/~.1f",
-                              [StationBin, Min/10, Mean/10, Max/10]);
-              Other ->
-                io:format("~p~n", [get()]),
-                throw({failed_to_lookup_station, Other, Station})
-            end
-        end, maps:to_list(Map))))
-    ++ "}".
 
+start_workers() ->
+  start_workers(erlang:system_info(logical_processors)).
 
-%% Chunk processor. Receives chunks from the main process, and parses
-%% them into temperatures.
-start_processors() ->
-  start_processors(erlang:system_info(logical_processors)).
-
-start_processors(NumProcs) ->
+start_workers(NumProcs) ->
   Self = self(),
-  io:format("Starting ~p parallell chunk processors~n", [NumProcs]),
+  io:format("Starting ~p parallel workers~n", [NumProcs]),
   lists:foldl(
     fun(_, Pids) ->
-        [spawn_link(fun() -> chunk_processor(Self) end)|Pids]
+        [spawn_link(fun() -> worker_loop(Self) end)|Pids]
     end, [], lists:seq(1, NumProcs)).
 
-chunk_processor(Pid) ->
+worker_loop(Pid) ->
   receive
     %% This only happens on the very last line.
     {chunk, [Chunk]} ->
       process_station(Chunk),
       Pid ! give_me_more,
-      chunk_processor(Pid);
+      worker_loop(Pid);
     {chunk, [First, Second]} ->
       case process_station(First) of
         <<>> ->
@@ -277,7 +155,7 @@ chunk_processor(Pid) ->
           process_station(<<Rest/binary, Second/binary>>)
       end,
       Pid ! give_me_more,
-      chunk_processor(Pid);
+      worker_loop(Pid);
     eof ->
       Map = maps:from_list(get()),
       Pid ! {result, Map},
@@ -287,12 +165,12 @@ chunk_processor(Pid) ->
   end.
 
 process_station(Station) ->
-  process_station(Station, 0).
+  process_station(Station, <<>>).
 
 process_station(<<";", Rest/bitstring>>, Station) ->
   process_temp(Rest, Station);
 process_station(<<C:8, Rest/bitstring>>, Station) ->
-  process_station(Rest, ?KEY(C, Station)); %% magic happens here
+  process_station(Rest, <<C, Station/binary>>);
 process_station(Bin, _) ->
   Bin.
 
