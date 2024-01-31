@@ -17,6 +17,13 @@
 %% process_* functions.
 -define(BUFSIZE, 2 * 1024 * 1024).
 
+%% Fnv32 hash function constants
+-define(FNV32_PRIME, 16777619).
+-define(FNV32_OFFSET, 2166136261).
+-define(FNV32_MASK, 16#ffffffff).
+
+-define(FNV32_HASH(C, Hash), (((Hash * ?FNV32_PRIME) bxor C) band ?FNV32_MASK)).
+
 input_filename([Filename]) ->
   Filename;
 input_filename([]) ->
@@ -31,23 +38,73 @@ run(Filename) ->
   process_flag(trap_exit, true),
   Workers = start_workers(),
   read_chunks(Filename, Workers),
-  io:format("Finished reading input file, waiting for workers to finish.~n", []),
   Map = wait_for_completion(Workers, #{}),
-  print_results(Map).
+  StationNames = map_station_names(Map, Filename),
+  print_results(Map, StationNames).
 
-print_results(Map) ->
+read_station_name(Bin) ->
+  maybe
+    [First, Rest] ?= binary:split(Bin, <<"\n">>),
+    [Name, _] ?= binary:split(First, <<";">>),
+    {Name, Rest}
+  else
+    _ -> false
+  end.
+
+%% The data received from the workers uses FNV32 hashes as keys,
+%% so to be able to print the actual station names, we need to
+%% scan the file from the beginning to find each station name.
+%%
+%% Note that this is vulnerable to badly formed input files. If we
+%% have a input file where there is a station name with only one
+%% reading as the very last line, this will cause this step to have to
+%% scan the *entire* file to find all the station names.
+map_station_names(Map, Filename) ->
+  {ok, FD} = file:open(Filename, [raw, read, binary]),
+  {ok, Bin} = file:pread(FD, 0, ?BUFSIZE),
+  map_station_names(Map, FD, Bin, #{}).
+
+map_station_names(Map, FD, Bin, StationNames) ->
+  case maps:size(Map) of
+    0 -> StationNames;
+    _ ->
+      case read_station_name(Bin) of
+        {StationName, Rest} ->
+          Key = fnv32_hash(StationName),
+          case maps:is_key(Key, StationNames) of
+            true ->
+              map_station_names(Map, FD, Rest, StationNames);
+            false ->
+              map_station_names(
+                maps:remove(Key, Map), FD, Rest,
+                maps:put(Key, StationName, StationNames))
+          end;
+        false ->
+          {ok, More} = file:pread(FD, 0, ?BUFSIZE),
+          map_station_names(Map, FD, <<Bin/binary, More/binary>>, StationNames)
+      end
+  end.
+
+print_results(Map, StationNames) ->
   Str = "{" ++
     lists:join(
       ", ",
       lists:sort(lists:map(
-        fun({Station, {Min, Max, Count, Sum}}) ->
+        fun({Key, {Min, Max, Count, Sum}}) ->
             Mean = Sum / Count,
-            Station0 = list_to_binary(lists:reverse(binary_to_list(Station))),
+            StationName = maps:get(Key, StationNames),
             io_lib:format("~ts=~.1f/~.1f/~.1f",
-                          [Station0, Min/10, Mean/10, Max/10])
+                          [StationName, Min/10, Mean/10, Max/10])
         end, maps:to_list(Map))))
     ++ "}",
   io:format("~ts~n", [Str]).
+
+fnv32_hash(Binary) ->
+  fnv32_hash(Binary, ?FNV32_OFFSET).
+fnv32_hash(<<>>, Hash) ->
+  Hash;
+fnv32_hash(<<C, Rest/binary>>, Hash) ->
+  fnv32_hash(Rest, ?FNV32_HASH(C, Hash)).
 
 %% Wait for workers to finish
 wait_for_completion([], Map) ->
@@ -165,12 +222,12 @@ worker_loop(Pid) ->
   end.
 
 process_station(Station) ->
-  process_station(Station, <<>>).
+  process_station(Station, ?FNV32_OFFSET).
 
-process_station(<<";", Rest/bitstring>>, Station) ->
-  process_temp(Rest, Station);
-process_station(<<C:8, Rest/bitstring>>, Station) ->
-  process_station(Rest, <<C, Station/binary>>);
+process_station(<<";", Rest/bitstring>>, Hash) ->
+  process_temp(Rest, Hash);
+process_station(<<C:8, Rest/bitstring>>, Hash) ->
+  process_station(Rest, ?FNV32_HASH(C, Hash));
 process_station(Bin, _) ->
   Bin.
 
