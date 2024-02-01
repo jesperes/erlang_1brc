@@ -36,6 +36,9 @@ main(Args) ->
 
 run(Filename) ->
   process_flag(trap_exit, true),
+  process_flag(message_queue_data, off_heap),
+  process_flag(priority, high),
+
   Workers = start_workers(),
   read_chunks(Filename, Workers),
   Map = wait_for_completion(Workers, #{}),
