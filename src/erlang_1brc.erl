@@ -2,12 +2,13 @@
 
 -feature(maybe_expr, enable).
 
--export([main/1]).
+-export([ main/1
+        ]).
 
 %% These inlinings are actually necessary. On my machine, it yields a
 %% 15-20% performance improvement.
 -compile({inline, [ {process_temp, 2}
-                  , {process_line, 3}
+                  , {store_temp, 3}
                   , {process_station, 2}
                   ]}).
 
@@ -191,19 +192,22 @@ start_workers() ->
   start_workers(erlang:system_info(logical_processors)).
 
 start_workers(NumProcs) ->
-  process_flag(message_queue_data, off_heap),
-  process_flag(priority, high),
-  Options = [link,
-             {min_heap_size, 1024*1024},
-             {min_bin_vheap_size, 1024*1024},
-             {max_heap_size, (1 bsl 59) -1}
+  io:format("Starting ~p parallel workers~n", [NumProcs]),
+  [spawn_worker() || _ <- lists:seq(1, NumProcs)].
+
+spawn_worker() ->
+  Options = [ link
+            , {min_heap_size, 1024*1024}
+            , {min_bin_vheap_size, 1024*1024}
+            , {max_heap_size, (1 bsl 59) -1}
             ],
   Self = self(),
-  io:format("Starting ~p parallel workers~n", [NumProcs]),
-  lists:foldl(
-    fun(_, Pids) ->
-        [spawn_opt(fun() -> worker_loop(Self) end, Options)|Pids]
-    end, [], lists:seq(1, NumProcs)).
+  spawn_opt(
+    fun() ->
+        process_flag(message_queue_data, off_heap),
+        process_flag(priority, high),
+        worker_loop(Self)
+    end, Options).
 
 worker_loop(Pid) ->
   receive
@@ -212,14 +216,23 @@ worker_loop(Pid) ->
       process_station(Chunk),
       Pid ! give_me_more,
       worker_loop(Pid);
-    {chunk, [First, Second]} ->
-      case process_station(First) of
+    {chunk, [Chunk, Trailing]} ->
+      %% `Chunk' is the primary chunk of data (of approximately
+      %% ?BUFSIZE bytes). `Trailing' is the remaining portion of the
+      %% last line, such that Chunk + Trailing contains complete
+      %% lines.
+      case process_station(Chunk) of
         <<>> ->
           ok;
         {Rest, Station} ->
-          process_temp(<<Rest/binary, Second/binary>>, Station);
+          %% This happend when `Chunk' ends in the middle of a
+          %% temperature reading. In this case `Rest' + `Trailing'
+          %% will form the full temperature reading.
+          <<>> = process_temp(<<Rest/binary, Trailing/binary>>, Station);
         Rest ->
-          process_station(<<Rest/binary, Second/binary>>)
+          %% This happens when `Chunk' ends in the middle of the
+          %% station name.
+          <<>> = process_station(<<Rest/binary, Trailing/binary>>)
       end,
       Pid ! give_me_more,
       worker_loop(Pid);
@@ -238,20 +251,20 @@ process_station(<<";", Rest/bitstring>>, Hash) ->
   process_temp(Rest, Hash);
 process_station(<<C:8, Rest/bitstring>>, Hash) ->
   process_station(Rest, ?FNV32_HASH(C, Hash));
-process_station(Bin, _) ->
-  Bin.
+process_station(<<>>, _) ->
+  <<>>.
 
 %% Specialized float parser for 2-digit floats with one fractional
 %% digit.
 -define(TO_NUM(C), (C - $0)).
 process_temp(<<$-, A, B, $., C, Rest/binary>>, Station) ->
-  process_line(Rest, Station, -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C)));
+  store_temp(Rest, Station, -1 * (?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C)));
 process_temp(<<$-, B, $., C, Rest/binary>>, Station) ->
-  process_line(Rest, Station, -1 * (?TO_NUM(B) * 10 + ?TO_NUM(C)));
+  store_temp(Rest, Station, -1 * (?TO_NUM(B) * 10 + ?TO_NUM(C)));
 process_temp(<<A, B, $., C, Rest/binary>>, Station) ->
-  process_line(Rest, Station, ?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C));
+  store_temp(Rest, Station, ?TO_NUM(A) * 100 + ?TO_NUM(B) * 10 + ?TO_NUM(C));
 process_temp(<<B, $., C, Rest/binary>>, Station) ->
-  process_line(Rest, Station, ?TO_NUM(B) * 10 + ?TO_NUM(C));
+  store_temp(Rest, Station, ?TO_NUM(B) * 10 + ?TO_NUM(C));
 process_temp(Rest, Station) ->
   %% This return breaks the match context reuse optimization, but it
   %% is only executed at the end of each chunk, so it doesn't really
@@ -259,7 +272,7 @@ process_temp(Rest, Station) ->
   %% with the two first ones in process_station/2.
   {Rest, Station}.
 
-process_line(Rest, Key, Temp) ->
+store_temp(Rest, Key, Temp) ->
   case get(Key) of
     undefined ->
       put(Key, {Temp, Temp, 1, Temp});
